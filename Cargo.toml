@@ -15,6 +15,7 @@ members = [
     "librio",
     "librio-wasm",
     "libsugarloaf",
+    "rio-ai",
 ]
 resolver = "2"
 
