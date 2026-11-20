@@ -458,6 +458,10 @@ impl EventListener for Listener {
 pub struct SurfaceDesc {
     pub shell: Option<String>,
     pub args: Vec<String>,
+    /// Where the shell starts: a path (a leading `~` is the home
+    /// directory), `home`, or `inherit` (as `None`) for the host's current
+    /// directory. One a shell can't be started in falls back to the
+    /// current directory, with a warning in the log.
     pub working_dir: Option<String>,
     pub cols: u16,
     pub rows: u16,
@@ -655,15 +659,6 @@ fn mouse_report(
         }
     }
     out
-}
-
-fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    if bracketed {
-        let filtered = text.replace(['\x1b', '\x03', '\u{9b}'], "");
-        format!("\x1b[200~{filtered}\x1b[201~").into_bytes()
-    } else {
-        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
-    }
 }
 
 /// A pty with the shell `desc` names, or the user's login shell.
@@ -926,18 +921,42 @@ impl Surface {
         self.write(text.as_bytes().to_vec());
     }
 
-    /// Paste text the way terminals do: when the program asked for
-    /// bracketed paste (mode 2004) the text is sent verbatim inside
-    /// ESC[200~/ESC[201~ markers, minus ESC, ETX and the 8-bit CSI so
-    /// the payload can never close the bracket early and inject
-    /// keystrokes; otherwise newlines are normalized to CR, what the
-    /// Enter key produces.
-    pub fn paste(&self, text: &str) {
+    /// Paste text the way Rio does, see [`rio_vt::paste::encode_in_place`]:
+    /// its control bytes as spaces so it can't end the bracket or act as
+    /// tty input, between the bracketed paste markers when the program
+    /// asked for them (mode 2004) with its line endings as they are, and
+    /// otherwise with LF as CR, what Enter sends.
+    ///
+    /// A `String` is encoded in its own buffer and sent as is, never
+    /// copied; a `&str` is copied once, since the writer thread needs the
+    /// bytes after this returns.
+    pub fn paste(&self, text: impl Into<String>) {
+        let text = text.into();
         if text.is_empty() {
             return;
         }
         let bracketed = self.terminal.lock().mode().contains(Mode::BRACKETED_PASTE);
-        self.write(encode_paste(text, bracketed));
+        let encoded = rio_vt::paste::encode_owned(text, bracketed);
+        // `write` snaps the view back once, for the whole paste; the rest
+        // follows in order.
+        if encoded.start.is_empty() {
+            self.write(encoded.text);
+        } else {
+            self.write(encoded.start);
+            self.send(encoded.text);
+            self.send(encoded.end);
+        }
+    }
+
+    /// Whether `text` can be pasted without asking the user first, for a
+    /// host that confirms pastes that could run commands: bracketed (mode
+    /// 2004), only a bracketed paste end is suspect; otherwise any line
+    /// break is too, since each line would run. See
+    /// [`rio_vt::paste::is_safe_with`]; a host that wants to ask about
+    /// bracketed line breaks too can use [`rio_vt::paste::is_safe`].
+    pub fn paste_is_safe(&self, text: &str) -> bool {
+        let bracketed = self.terminal.lock().mode().contains(Mode::BRACKETED_PASTE);
+        rio_vt::paste::is_safe_with(text, bracketed)
     }
 
     /// A stable, C-friendly view of the terminal modes an embedder needs
@@ -2050,29 +2069,6 @@ mod tests {
         assert_eq!(state.link_run(0, 0), None);
     }
 
-    // Bracketed paste sends the text verbatim minus ESC/ETX, so a
-    // malicious payload cannot close the bracket and inject keystrokes;
-    // unbracketed paste normalizes newlines to CR.
-    #[test]
-    fn paste_encoding_is_injection_safe() {
-        assert_eq!(
-            encode_paste("one\ntwo", true),
-            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
-        );
-        assert_eq!(
-            encode_paste("a\x1b[201~rm -rf /\x03", true),
-            b"\x1b[200~a[201~rm -rf /\x1b[201~".to_vec()
-        );
-        assert_eq!(
-            encode_paste("a\u{9b}201~oops", true),
-            b"\x1b[200~a201~oops\x1b[201~".to_vec()
-        );
-        assert_eq!(
-            encode_paste("one\r\ntwo\nthree", false),
-            b"one\rtwo\rthree".to_vec()
-        );
-    }
-
     // mode_bits mirrors the private modes programs toggle at runtime.
     #[test]
     fn mode_bits_track_private_modes() {
@@ -2125,6 +2121,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(text.matches("^[[I").count(), 1, "{text:?}");
+    }
+
+    // A host confirms pastes that could run commands: any line break
+    // while the program takes pastes as typing, only a bracket end once it
+    // asks for bracketed paste.
+    #[test]
+    fn paste_is_safe_follows_bracketed_paste() {
+        let surface = quiet_surface(20, 5);
+        assert!(surface.paste_is_safe("ls -la"));
+        assert!(!surface.paste_is_safe("ls\nrm -rf ~"));
+        surface.inject_output(b"\x1b[?2004h");
+        assert!(surface.paste_is_safe("ls\nrm -rf ~"));
+        assert!(!surface.paste_is_safe("a\x1b[201~rm"));
     }
 
     // paste() keys off live terminal state: markers go to the child only

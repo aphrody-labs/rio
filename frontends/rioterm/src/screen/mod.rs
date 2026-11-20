@@ -15,7 +15,7 @@ use crate::bindings::{
     ViAction,
 };
 use crate::context;
-use crate::context::renderable::{Cursor, RenderableContent};
+use crate::context::renderable::RenderableContent;
 use crate::context::{next_rich_text_id, process_open_url, ContextManager};
 use crate::crosswords::{
     grid::{Dimensions, Scroll},
@@ -35,7 +35,7 @@ use rio_backend::clipboard::Clipboard;
 use rio_backend::clipboard::ClipboardType;
 use rio_backend::config::layout::Margin;
 use rio_backend::config::renderer::Backend;
-use rio_backend::crosswords::pos::{Boundary, CursorState, Direction, Line};
+use rio_backend::crosswords::pos::{Boundary, Direction, Line};
 use rio_backend::crosswords::search::RegexSearch;
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::{ClickState, EventProxy, SearchState};
@@ -135,6 +135,22 @@ pub struct ScreenWindowProperties {
 #[inline]
 fn window_should_be_opaque(config: &rio_backend::config::Config) -> bool {
     config.window.opacity >= 1.0 && !config.window.blur.is_glass()
+}
+
+/// A warning for a `working-dir` shells can't start in (they start in the
+/// current directory instead), which would otherwise only reach the log.
+/// Not under Flatpak, where shells start on the host, which may see
+/// directories the sandbox can't.
+fn working_dir_error(config: &rio_backend::config::Config) -> Option<RioError> {
+    let dir = config.working_dir.as_deref()?;
+    if teletypewriter::in_flatpak() {
+        return None;
+    }
+    let why = teletypewriter::check_working_dir(dir).err()?;
+    Some(RioError {
+        level: RioErrorLevel::Warning,
+        report: RioErrorType::InvalidWorkingDirectory(why),
+    })
 }
 
 impl Screen<'_> {
@@ -267,6 +283,8 @@ impl Screen<'_> {
             scrollback_history_limit: config.scrollback_history_limit,
             grapheme_clustering: config.grapheme_clustering,
             colors: rio_backend::config::colors::term::List::from(&config.colors),
+            cursor_shape: config.cursor.shape,
+            cursor_blinking: config.cursor.blinking,
         };
 
         let rich_text_id = next_rich_text_id();
@@ -297,14 +315,7 @@ impl Screen<'_> {
             margin,
         );
 
-        let cursor = Cursor {
-            content: config.cursor.shape.into(),
-            state: CursorState::new(config.cursor.shape.into()),
-        };
-
         let context_manager = context::ContextManager::start(
-            // config.cursor.blinking
-            (&cursor, config.cursor.blinking),
             event_proxy,
             window_id.into(),
             rich_text_id,
@@ -326,6 +337,9 @@ impl Screen<'_> {
             }
         } else {
             sugarloaf.clear_background_image();
+        }
+        if let Some(error) = working_dir_error(config) {
+            renderer.assistant.set_error(error);
         }
 
         Ok(Screen {
@@ -609,10 +623,12 @@ impl Screen<'_> {
                     .renderable_content
                     .pending_update
                     .set_dirty();
-                let shape = config.cursor.shape;
-                terminal.cursor_shape = shape;
-                terminal.default_cursor_shape = shape;
-                terminal.blinking_cursor = config.cursor.blinking;
+                // The new default shows only while no program chose a
+                // style (an editor's insert-mode beam stays).
+                terminal.set_default_cursor_style(
+                    config.cursor.shape,
+                    config.cursor.blinking,
+                );
                 drop(terminal);
             }
         }
@@ -622,6 +638,9 @@ impl Screen<'_> {
 
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard.clone();
+        // New terminals take the reloaded cursor defaults.
+        self.context_manager.config.cursor_shape = config.cursor.shape;
+        self.context_manager.config.cursor_blinking = config.cursor.blinking;
         self.context_manager.config.title = config.title.clone();
 
         // Re-evaluate the opaque flag — toggling `window.opacity` /
@@ -641,6 +660,9 @@ impl Screen<'_> {
             }
         } else {
             self.sugarloaf.clear_background_image();
+        }
+        if let Some(error) = working_dir_error(config) {
+            self.renderer.assistant.set_error(error);
         }
     }
 
@@ -1029,7 +1051,7 @@ impl Screen<'_> {
                 && binding.action == Act::PasteSelection
             {
                 let content = clipboard.get(ClipboardType::Selection);
-                self.paste(&content, true);
+                self.paste_from_clipboard(content);
             }
         }
     }
@@ -1088,18 +1110,18 @@ impl Screen<'_> {
                 match &action {
                     Act::Run(program) => self.exec(program.program(), program.args()),
                     Act::Esc(s) => {
-                        self.paste(s, false);
+                        self.paste(s.clone(), false);
                     }
                     Act::Paste => {
                         let content = clipboard.get(ClipboardType::Clipboard);
-                        self.paste(&content, true);
+                        self.paste_from_clipboard(content);
                     }
                     Act::ClearSelection => {
                         self.clear_selection();
                     }
                     Act::PasteSelection => {
                         let content = clipboard.get(ClipboardType::Selection);
-                        self.paste(&content, true);
+                        self.paste_from_clipboard(content);
                     }
                     Act::Copy => {
                         self.copy_selection(ClipboardType::Clipboard, clipboard);
@@ -3680,7 +3702,33 @@ impl Screen<'_> {
     }
 
     #[inline]
-    pub fn paste(&mut self, text: &str, bracketed: bool) {
+    /// Paste what the user pasted from a clipboard, first asking them
+    /// if it could run commands (`paste-protection`): the text is held by
+    /// the confirmation dialog, which pastes it on yes.
+    pub fn paste_from_clipboard(&mut self, text: String) {
+        // Windows ends every line on its clipboard with CRLF, which would
+        // paste as two line breaks (#1669): line endings as text has them
+        // before the paste is checked, shown or sent.
+        #[cfg(windows)]
+        let text = rio_backend::paste::from_windows_clipboard(text);
+        let bracketed = self.get_mode().contains(Mode::BRACKETED_PASTE);
+        if !self.search_active()
+            && self
+                .renderer
+                .confirm_paste
+                .needs_confirmation(&text, bracketed)
+        {
+            self.renderer.confirm_paste.hold(text, bracketed);
+            self.mark_dirty();
+            return;
+        }
+        self.paste(text, true);
+    }
+
+    /// Paste `text`, bracketed when `bracketed` and the program asked for
+    /// it. The text is encoded in its own buffer and written between the
+    /// markers, never copied: a large paste costs one pass over it.
+    pub fn paste(&mut self, text: String, bracketed: bool) {
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
@@ -3696,41 +3744,22 @@ impl Screen<'_> {
             self.scroll_bottom_when_cursor_not_visible();
             self.clear_selection();
 
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(&b"\x1b[200~"[..]);
-
-            // Write filtered escape sequences.
-            //
-            // We remove `\x1b` to ensure it's impossible for the pasted text to write the bracketed
-            // paste end escape `\x1b[201~` and `\x03` since some shells incorrectly terminate
-            // bracketed paste on its receival.
-            let filtered = text.replace(['\x1b', '\x03'], "");
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(filtered.into_bytes());
-
-            self.ctx_mut()
-                .current_mut()
-                .messenger
-                .send_write(&b"\x1b[201~"[..]);
+            // The markers, and the text with its control bytes as
+            // spaces so it can't end the bracket or act as tty input.
+            let encoded = rio_backend::paste::encode_owned(text, true);
+            let messenger = &self.ctx_mut().current_mut().messenger;
+            messenger.send_write(encoded.start);
+            messenger.send_write(encoded.text);
+            messenger.send_write(encoded.end);
         } else {
             let payload = if bracketed {
-                // In non-bracketed (ie: normal) mode, terminal applications cannot distinguish
-                // pasted data from keystrokes.
-                //
-                // In theory, we should construct the keystrokes needed to produce the data we are
-                // pasting... since that's neither practical nor sensible (and probably an
-                // impossible task to solve in a general way), we'll just replace line breaks
-                // (windows and unix style) with a single carriage return (\r, which is what the
-                // Enter key produces).
-                text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+                // The program can't tell a paste from typing: control
+                // bytes become spaces and LF is what Enter sends.
+                rio_backend::paste::encode_owned(text, false).text
             } else {
                 // When we explicitly disable bracketed paste don't manipulate with the input,
                 // so we pass user input as is.
-                text.to_owned().into_bytes()
+                text.into_bytes()
             };
 
             self.ctx_mut().current_mut().messenger.send_write(payload);
@@ -3831,7 +3860,7 @@ impl Screen<'_> {
             }
             PaletteAction::Paste => {
                 let content = clipboard.get(ClipboardType::Clipboard);
-                self.paste(&content, true);
+                self.paste_from_clipboard(content);
             }
             PaletteAction::SearchForward => {
                 self.start_search(Direction::Right);
@@ -3959,8 +3988,8 @@ impl Screen<'_> {
                 // rows; today's clamps keep it non-negative, but a
                 // negative Line wrapping through `as usize` would fling
                 // the trail target off by ~10^18 px, so clamp first.
-                let cursor_row = cursor.state.pos.row.0.max(0) as usize;
-                let cursor_col = cursor.state.pos.col.0;
+                let cursor_row = cursor.pos.row.0.max(0) as usize;
+                let cursor_col = cursor.pos.col.0;
 
                 // Cursor position in physical pixels.
                 let cursor_px_x = origin_x + cursor_col as f32 * cell_width;
@@ -3971,8 +4000,8 @@ impl Screen<'_> {
                     cursor_px_y,
                     cell_width,
                     cell_height,
-                    cursor.state.content,
-                    cursor.state.is_visible(),
+                    cursor.content,
+                    cursor.is_visible(),
                     current.route_id,
                 );
 
@@ -4143,7 +4172,7 @@ impl Screen<'_> {
                 // rows already held instead of copied again, and a
                 // frame that was only a cursor move becomes a partial
                 // one so the emit loop rebuilds them.
-                let cursor = &ctx.renderable_content.cursor.state;
+                let cursor = &ctx.renderable_content.cursor;
                 let shaped_cursor = (self.renderer.cursor_shaping_break
                     && cursor.is_visible()
                     && cursor.content != rio_backend::ansi::CursorShape::Hidden)
@@ -4202,7 +4231,7 @@ impl Screen<'_> {
                 } else {
                     None
                 };
-                let cursor_shape = cursor.state.content;
+                let cursor_shape = cursor.content;
                 let cursor_blinking = ctx.renderable_content.has_blinking_enabled;
                 let cursor_blink_visible =
                     !cursor_blinking || ctx.renderable_content.is_blinking_cursor_visible;
@@ -4215,9 +4244,9 @@ impl Screen<'_> {
                         rio_grid::preedit::PreeditLine::new(
                             &preedit.text,
                             preedit.cursor,
-                            (cursor.state.pos.row.0.max(0) as usize)
+                            (cursor.pos.row.0.max(0) as usize)
                                 .min(ctx.renderable_content.screen_lines.max(1) - 1),
-                            cursor.state.pos.col.0,
+                            cursor.pos.col.0,
                             ctx.renderable_content.columns.max(1),
                         )
                     })
@@ -4242,9 +4271,9 @@ impl Screen<'_> {
                     row_styles,
                     extras,
                     term_colors,
-                    cursor_col: cursor.state.pos.col.0 as u16,
-                    cursor_row: cursor.state.pos.row.0 as u16,
-                    cursor_visible: cursor.state.is_visible(),
+                    cursor_col: cursor.pos.col.0 as u16,
+                    cursor_row: cursor.pos.row.0 as u16,
+                    cursor_visible: cursor.is_visible(),
                     cursor_shape,
                     cursor_blinking,
                     cursor_blink_visible,
@@ -4721,7 +4750,6 @@ impl Screen<'_> {
         // In case the configuration of blinking cursor is enabled
         // TODO: enable blinking for selection after adding debounce (https://github.com/raphamorim/rio/issues/437)
         if self.renderer.is_window_focused
-            && self.renderer.config_has_blinking_enabled
             && self.selection_is_empty()
             && self
                 .context_manager
@@ -4755,7 +4783,7 @@ impl Screen<'_> {
         };
 
         let layout = current_item.val.dimension;
-        let cursor_pos = current_item.val.renderable_content.cursor.state.pos;
+        let cursor_pos = current_item.val.renderable_content.cursor.pos;
 
         // While composing, the candidate popup follows the IME caret,
         // not the terminal cursor: the composition renders inline and
@@ -4918,7 +4946,7 @@ impl Screen<'_> {
                     clipboard.set(ClipboardType::Clipboard, hint_match.text.clone());
                 }
                 HintInternalAction::Paste => {
-                    self.paste(&hint_match.text, true);
+                    self.paste(hint_match.text.clone(), true);
                 }
                 HintInternalAction::Select => {
                     // Set selection to the hint match
@@ -5155,5 +5183,40 @@ mod tests {
             at: std::time::Instant::now() - crate::constants::MULTI_CLICK_THRESHOLD * 2,
         };
         assert!(!stale.validates_double_click(origin));
+    }
+}
+
+#[cfg(test)]
+mod working_dir_error_tests {
+    use super::working_dir_error;
+    use rio_backend::config::Config;
+    use rio_backend::error::RioErrorType;
+
+    fn with_dir(dir: Option<String>) -> Config {
+        Config {
+            working_dir: dir,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn unset_or_usable_is_no_error() {
+        assert!(working_dir_error(&with_dir(None)).is_none());
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(working_dir_error(&with_dir(Some(tmp))).is_none());
+        assert!(working_dir_error(&with_dir(Some("~".into()))).is_none());
+    }
+
+    #[test]
+    fn a_missing_directory_is_reported() {
+        let missing = std::env::temp_dir()
+            .join("rio-working-dir-that-does-not-exist")
+            .to_string_lossy()
+            .into_owned();
+        let error = working_dir_error(&with_dir(Some(missing))).expect("reported");
+        assert!(matches!(
+            error.report,
+            RioErrorType::InvalidWorkingDirectory(ref why) if why.contains("can't be opened")
+        ));
     }
 }

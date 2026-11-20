@@ -1479,6 +1479,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             WindowEvent::MouseInput { state, button, .. } => {
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
+                    || route.window.screen.renderer.confirm_paste.is_active()
                 {
                     #[cfg(target_os = "macos")]
                     if state == ElementState::Pressed
@@ -1862,6 +1863,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
+                    || route.window.screen.renderer.confirm_paste.is_active()
                 {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     return;
@@ -2155,6 +2157,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
+                    || route.window.screen.renderer.confirm_paste.is_active()
                 {
                     return;
                 }
@@ -2269,7 +2272,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             return;
                         }
                         // Don't use bracketed paste for single char input.
-                        route.window.screen.paste(&text, text.chars().count() > 1);
+                        let bracketed = text.chars().count() > 1;
+                        route.window.screen.paste(text, bracketed);
                     }
                     Ime::Preedit(text, cursor_offset) => {
                         let preedit = if text.is_empty() || route.modal_owns_input() {
@@ -2394,7 +2398,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
 
                 let path = crate::platform::shell_escape(&path.to_string_lossy());
-                route.window.screen.paste(&(path + " "), true);
+                route.window.screen.paste(path + " ", true);
             }
 
             WindowEvent::Resized(new_size) => {
@@ -2582,6 +2586,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         // Restore the original modifiers
         route.window.screen.set_modifiers(original_modifiers);
+
+        // As for a key from the keyboard: `process_key_event` only marks
+        // what changed. A menu paste held for confirmation writes nothing
+        // to the shell, so no output would redraw the dialog.
+        route.request_redraw();
     }
 
     // Emitted when the event loop is being shut down.
